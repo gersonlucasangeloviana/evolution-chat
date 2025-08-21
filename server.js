@@ -1,33 +1,66 @@
+\
 import express from 'express';
 import pkg from 'pg';
 import basicAuth from 'basic-auth';
 const { Pool } = pkg;
 
 // ======= Config =======
-const PORT = process.env.PORT || 3000;
+const APP = process.env.APP_NAME || 'Evolution Messages Viewer';
+const PORT = Number(process.env.PORT || 3000);     // porta do APP HTTP
+const LOG_LEVEL = (process.env.LOG_LEVEL || 'info').toLowerCase(); // info | debug
 const ADMIN_USER = process.env.ADMIN_USER || 'admin';
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
 
-// Conexão com PostgreSQL (usa DATABASE_URL ou variáveis PG*)
+// ======= Logger simples =======
+const levels = { debug: 10, info: 20, warn: 30, error: 40 };
+function log(level, ...args){
+  if ((levels[level] ?? 20) < (levels[LOG_LEVEL] ?? 20)) return;
+  const ts = new Date().toISOString();
+  console.log(`[${ts}] ${level.toUpperCase()}`, ...args);
+}
+function debug(...a){ log('debug', ...a); }
+function info(...a){ log('info', ...a); }
+function warn(...a){ log('warn', ...a); }
+function error(...a){ log('error', ...a); }
+
+// ======= Conexão PostgreSQL =======
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   host: process.env.PGHOST,
-  port: process.env.PGPORT ? Number(process.env.PGPORT) : undefined,
+  port: process.env.PGPORT ? Number(process.env.PGPORT) : undefined, // porta do DB (padrão 5432)
   user: process.env.PGUSER,
   password: process.env.PGPASSWORD,
   database: process.env.PGDATABASE,
   ssl: process.env.PGSSL === 'require' ? { rejectUnauthorized: false } : undefined,
 });
 
-// Schemas e tabelas fixos
 const PGSCHEMA = process.env.PGSCHEMA || 'public';
 const T_INSTANCE = `${PGSCHEMA}."Instance"`;
 const T_CHAT = `${PGSCHEMA}."Chat"`;
 const T_MESSAGE = `${PGSCHEMA}."Message"`;
 
-// ======= Auth (opcional, mas recomendado) =======
+// ======= App =======
+const app = express();
+app.use(express.json({ limit: '1mb' }));
+
+// ======= Request logger =======
+let reqSeq = 0;
+app.use((req, res, next) => {
+  const id = (++reqSeq).toString(36);
+  const start = Date.now();
+  const q = Object.keys(req.query || {}).length ? `?${new URLSearchParams(req.query).toString()}` : '';
+  debug(`REQ#${id} ${req.method} ${req.path}${q} from ${req.ip||'-'}`);
+  res.on('finish', () => {
+    const ms = Date.now() - start;
+    debug(`RES#${id} ${req.method} ${req.path} -> ${res.statusCode} (${ms}ms)`);
+  });
+  res.setHeader('X-Request-Id', id);
+  next();
+});
+
+// ======= Auth básica =======
 function authMiddleware(req, res, next) {
-  if (!ADMIN_PASSWORD) return next(); // sem senha -> aberto (use somente em redes privadas!)
+  if (!ADMIN_PASSWORD) return next();
   const creds = basicAuth(req);
   if (!creds || creds.name !== ADMIN_USER || creds.pass !== ADMIN_PASSWORD) {
     res.set('WWW-Authenticate', 'Basic realm="Protected"');
@@ -36,209 +69,29 @@ function authMiddleware(req, res, next) {
   next();
 }
 
-// ======= App =======
-const app = express();
-app.use(express.json({ limit: '2mb' }));
-
-// Saúde
+// ======= HEALTH: sempre 200 =======
 app.get('/health', async (req, res) => {
   let db = false;
   try {
     const r = await pool.query('SELECT 1 as n');
     db = r.rows?.[0]?.n === 1;
   } catch (e) {
-    db = false; // não derruba o health
+    debug('HEALTH DB error:', e.message);
+    db = false;
   }
   res.json({ ok: true, db });
 });
 
-// ======= API: Lista Instâncias =======
-app.get('/api/instances', authMiddleware, async (req, res) => {
-  try {
-    const { rows } = await pool.query(
-      `SELECT id, name, number, "connectionStatus", "updatedAt" FROM ${T_INSTANCE} ORDER BY name ASC`
-    );
-    res.json(rows);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// ======= API: Lista Chats por Instância =======
-app.get('/api/chats', authMiddleware, async (req, res) => {
-  const instanceId = (req.query.instanceId||'').toString();
-  const q = (req.query.q||'').toString().trim();
-  const limit = Math.min(parseInt(req.query.limit||'50',10), 200);
-  const page = Math.max(parseInt(req.query.page||'0',10), 0);
-  if (!instanceId) return res.status(400).json({ error: 'instanceId é obrigatório' });
-  const params = [instanceId];
-  let where = 'WHERE "instanceId" = $1';
-  if (q) {
-    params.push('%'+q+'%');
-    where += ` AND ( "remoteJid" ILIKE $${params.length} OR COALESCE(name,'') ILIKE $${params.length} )`;
-  }
-  params.push(limit, page*limit);
-  try {
-    const sql = `SELECT id, "remoteJid", name, "updatedAt" FROM ${T_CHAT} ${where}
-                 ORDER BY "updatedAt" DESC NULLS LAST
-                 LIMIT $${params.length-1} OFFSET $${params.length}`;
-    const { rows } = await pool.query(sql, params);
-    res.json(rows);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// ======= Util: extrai campos de mídia dos JSONs =======
-function extractMedia(message) {
-  if (!message || typeof message !== 'object') return null;
-  const get = (o, path) => path.split('.').reduce((a, k) => (a && a[k] != null ? a[k] : undefined), o);
-
-  // Possíveis tipos com mídia
-  const candidates = [
-    { type: 'image', path: 'imageMessage' },
-    { type: 'video', path: 'videoMessage' },
-    { type: 'document', path: 'documentMessage' },
-    { type: 'audio', path: 'audioMessage' },
-    { type: 'sticker', path: 'stickerMessage' }
-  ];
-  for (const c of candidates) {
-    const node = get(message, c.path);
-    if (node) {
-      const caption = node.caption || node.text || '';
-      const mimetype = node.mimetype || '';
-      const fileName = node.fileName || '';
-      const fileLength = node.fileLength || node.seconds || '';
-      const directPath = node.directPath || node.url || ''; // nem sempre presente
-      const jpegThumb = node.jpegThumbnail || null; // base64 (quando existir)
-      return { kind: c.type, caption, mimetype, fileName, fileLength, directPath, jpegThumbnail: jpegThumb };
-    }
-  }
-  return null;
-}
-
-// ======= API: Lista Mensagens (por instância e chat) =======
-app.get('/api/messages', authMiddleware, async (req, res) => {
-  const instanceId = (req.query.instanceId||'').toString();
-  const remoteJid = (req.query.remoteJid||'').toString();
-  const text = (req.query.text||'').toString().trim();
-  const direction = (req.query.direction||'').toString().trim(); // '' | 'in' | 'out'
-  const start = (req.query.start||'').toString().trim();
-  const end = (req.query.end||'').toString().trim();
-  const limit = Math.min(parseInt(req.query.limit||'50',10), 500);
-  const page = Math.max(parseInt(req.query.page||'0',10), 0);
-  if (!instanceId || !remoteJid) return res.status(400).json({ error: 'instanceId e remoteJid são obrigatórios' });
-
-  const params = [instanceId, remoteJid];
-  const where = [
-    '"instanceId" = $1',
-    "(key->>'remoteJid') = $2"
-  ];
-  if (text) {
-    params.push('%'+text+'%');
-    where.push(`(
-      message->>'conversation' ILIKE $${params.length}
-      OR message->'extendedTextMessage'->>'text' ILIKE $${params.length}
-      OR message->'imageMessage'->>'caption' ILIKE $${params.length}
-      OR message->'videoMessage'->>'caption' ILIKE $${params.length}
-      OR message->'documentMessage'->>'caption' ILIKE $${params.length}
-    )`);
-  }
-  if (direction === 'in' || direction === 'out') {
-    params.push(direction === 'out');
-    where.push(`(key->>'fromMe')::boolean = $${params.length}`);
-  }
-  if (start) { params.push(new Date(start).getTime()/1000); where.push(`"messageTimestamp" >= $${params.length}`); }
-  if (end) { params.push(new Date(end).getTime()/1000); where.push(`"messageTimestamp" <= $${params.length}`); }
-
-  const baseSelect = `SELECT
-      id,
-      key,
-      message,
-      (key->>'remoteJid') AS "remoteJid",
-      (key->>'fromMe')::boolean AS from_me,
-      "messageType" AS type,
-      status,
-      to_timestamp("messageTimestamp") AT TIME ZONE 'UTC' AS when_utc
-    FROM ${T_MESSAGE}`;
-
-  const whereSql = 'WHERE ' + where.join(' AND ');
-  const orderSql = 'ORDER BY "messageTimestamp" DESC';
-
-  try {
-    const total = (await pool.query(`SELECT COUNT(*)::int AS n FROM ${T_MESSAGE} ${whereSql}`, params)).rows[0].n;
-    const dataParams = params.concat([limit, page*limit]);
-    const { rows } = await pool.query(`${baseSelect} ${whereSql} ${orderSql} LIMIT $${params.length+1} OFFSET $${params.length+2}`, dataParams);
-
-    const out = rows.map(r => {
-      // texto
-      const text =
-        (r.message?.conversation) ||
-        (r.message?.extendedTextMessage?.text) ||
-        (r.message?.imageMessage?.caption) ||
-        (r.message?.videoMessage?.caption) ||
-        (r.message?.documentMessage?.caption) ||
-        (r.message?.contactMessage?.displayName) ||
-        '';
-
-    const media = extractMedia(r.message);
-
-      return {
-        id: r.id,
-        jid: r.remoteJid,
-        when: new Date(r.when_utc).toISOString().replace('T',' ').slice(0,19),
-        direction: r.from_me ? 'out' : 'in',
-        type: r.type,
-        text: text,
-        status: r.status || '',
-        media: media
-      };
-    });
-    res.json({ total, rows: out });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// ======= API: Mensagem por ID (raw JSON para debug/integração) =======
-app.get('/api/messages/:id', authMiddleware, async (req, res) => {
-  const id = req.params.id;
-  try {
-    const { rows } = await pool.query(`SELECT id, key, message, "messageType", status, "messageTimestamp" FROM ${T_MESSAGE} WHERE id = $1`, [id]);
-    if (!rows.length) return res.status(404).json({ error: 'not found' });
-    res.json(rows[0]);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// ======= Export CSV =======
-app.get('/api/messages.csv', authMiddleware, async (req, res) => {
-  req.query.limit = req.query.limit || '2000';
-  req.query.page = req.query.page || '0';
-  const params = new URLSearchParams(req.query);
-  const url = `http://127.0.0.1:${PORT}/api/messages?${params.toString()}`;
-  const r = await fetch(url);
-  const json = await r.json();
-  res.setHeader('Content-Type','text/csv; charset=utf-8');
-  res.setHeader('Content-Disposition','attachment; filename="messages.csv"');
-  const header = 'id,when,direction,jid,type,text,status\n';
-  const body = json.rows.map(m => [m.id,m.when,m.direction,m.jid,m.type,(m.text||'').replaceAll('\n',' ').replaceAll('"','""'),m.status]
-      .map(v => '"'+(v??'')+'"').join(',')).join('\n');
-  res.send(header+body+'\n');
-});
-
 // ======= UI =======
 app.get('/', authMiddleware, (req, res) => {
+  info('Serving UI /');
   res.type('html').send(`<!doctype html>
 <html lang="pt-br">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Evolution Messages Viewer</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <title>${APP}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
   <style>
@@ -251,7 +104,6 @@ app.get('/', authMiddleware, (req, res) => {
     .grid{display:grid;gap:12px}
     .row{display:flex;gap:12px;flex-wrap:wrap}
     input,select,button{background:#0b1230;color:var(--fg);border:1px solid #1c2b6c;border-radius:10px;padding:10px 12px}
-    button{cursor:pointer}
     table{width:100%;border-collapse:collapse}
     th,td{padding:10px;border-bottom:1px solid #1c2b6c;vertical-align:top}
     th{position:sticky;top:0;background:#0b1230}
@@ -264,8 +116,8 @@ app.get('/', authMiddleware, (req, res) => {
 </head>
 <body>
   <div class="wrap" x-data="viewer()">
-    <h1 class="h">Evolution Messages Viewer</h1>
-    <p class="muted">Fluxo: Instância → Chat → Mensagens (somente leitura). Suporte a <b>preview de mídia</b> e <b>copiar texto</b>.</p>
+    <h1 class="h">${APP}</h1>
+    <p class="muted">Fluxo: Instância → Chat → Mensagens (somente leitura). Logs detalhados habilite com <code>LOG_LEVEL=debug</code>.</p>
 
     <div class="card" style="padding:16px; margin:16px 0;">
       <div class="grid" style="grid-template-columns: repeat(auto-fit,minmax(220px,1fr));">
@@ -418,7 +270,7 @@ function viewer(){
       const r = await fetch('/api/messages?'+p.toString());
       const json = await r.json();
       this.rows = json.rows;
-      this.meta = 'Exibindo ' + json.rows.length + ' de ' + json.total + ' registros (página ' + (this.page+1) + ').';
+      this.meta = `Exibindo ${json.rows.length} de ${json.total} registros (página ${this.page+1}).`;
     },
     next(){ this.page++; this.fetchMessages(); },
     prev(){ if(this.page>0){ this.page--; this.fetchMessages(); } },
@@ -431,7 +283,175 @@ function viewer(){
 </html>`);
 });
 
-// Inicia servidor
-app.listen(PORT, () => {
-  console.log(`Evolution Messages Viewer rodando em http://0.0.0.0:${PORT}`);
+// ======= Helpers =======
+function extractMedia(message) {
+  if (!message || typeof message !== 'object') return null;
+  const get = (o, path) => path.split('.').reduce((a, k) => (a && a[k] != null ? a[k] : undefined), o);
+  const candidates = [
+    { type: 'image', path: 'imageMessage' },
+    { type: 'video', path: 'videoMessage' },
+    { type: 'document', path: 'documentMessage' },
+    { type: 'audio', path: 'audioMessage' },
+    { type: 'sticker', path: 'stickerMessage' }
+  ];
+  for (const c of candidates) {
+    const node = get(message, c.path);
+    if (node) {
+      const caption = node.caption || node.text || '';
+      const mimetype = node.mimetype || '';
+      const fileName = node.fileName || '';
+      const fileLength = node.fileLength || node.seconds || '';
+      const directPath = node.directPath || node.url || '';
+      const jpegThumb = node.jpegThumbnail || null;
+      return { kind: c.type, caption, mimetype, fileName, fileLength, directPath, jpegThumbnail: jpegThumb };
+    }
+  }
+  return null;
+}
+
+// ======= API =======
+app.get('/api/instances', authMiddleware, async (req, res) => {
+  const t0 = Date.now();
+  try {
+    const sql = `SELECT id, name, number, "connectionStatus", "updatedAt" FROM ${T_INSTANCE} ORDER BY name ASC`;
+    debug('SQL instances:', sql);
+    const { rows } = await pool.query(sql);
+    info(`instances -> ${rows.length} rows (${Date.now()-t0}ms)`);
+    res.json(rows);
+  } catch (e) {
+    error('instances ERROR:', e.message);
+    res.status(500).json({ error: e.message });
+  }
 });
+
+app.get('/api/chats', authMiddleware, async (req, res) => {
+  const { instanceId } = req.query;
+  const q = (req.query.q||'').toString().trim();
+  const limit = Math.min(parseInt(req.query.limit||'50',10), 200);
+  const page = Math.max(parseInt(req.query.page||'0',10), 0);
+  if (!instanceId) return res.status(400).json({ error: 'instanceId é obrigatório' });
+  const t0 = Date.now();
+  const params = [instanceId];
+  let where = 'WHERE "instanceId" = $1';
+  if (q) { params.push('%'+q+'%'); where += ` AND ("remoteJid" ILIKE $${params.length} OR COALESCE(name,'') ILIKE $${params.length})`; }
+  params.push(limit, page*limit);
+  try {
+    const sql = `SELECT id, "remoteJid", name, "updatedAt" FROM ${T_CHAT} ${where} ORDER BY "updatedAt" DESC NULLS LAST LIMIT $${params.length-1} OFFSET $${params.length}`;
+    debug('SQL chats:', sql, params);
+    const { rows } = await pool.query(sql, params);
+    info(`chats(instance=${instanceId}) -> ${rows.length} rows (${Date.now()-t0}ms)`);
+    res.json(rows);
+  } catch (e) {
+    error('chats ERROR:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/messages', authMiddleware, async (req, res) => {
+  const instanceId = (req.query.instanceId||'').toString();
+  const remoteJid = (req.query.remoteJid||'').toString();
+  const text = (req.query.text||'').toString().trim();
+  const direction = (req.query.direction||'').toString().trim();
+  const start = (req.query.start||'').toString().trim();
+  const end = (req.query.end||'').toString().trim();
+  const limit = Math.min(parseInt(req.query.limit||'50',10), 500);
+  const page = Math.max(parseInt(req.query.page||'0',10), 0);
+  if (!instanceId || !remoteJid) return res.status(400).json({ error: 'instanceId e remoteJid são obrigatórios' });
+
+  const t0 = Date.now();
+  const params = [instanceId, remoteJid];
+  const where = [ '"instanceId" = $1', "(key->>'remoteJid') = $2" ];
+  if (text) { params.push('%'+text+'%'); where.push(`(message->>'conversation' ILIKE $${params.length} OR message->'extendedTextMessage'->>'text' ILIKE $${params.length} OR message->'imageMessage'->>'caption' ILIKE $${params.length} OR message->'videoMessage'->>'caption' ILIKE $${params.length} OR message->'documentMessage'->>'caption' ILIKE $${params.length})`); }
+  if (direction === 'in' || direction === 'out') { params.push(direction === 'out'); where.push(`(key->>'fromMe')::boolean = $${params.length}`); }
+  if (start) { params.push(new Date(start).getTime()/1000); where.push(`"messageTimestamp" >= $${params.length}`); }
+  if (end) { params.push(new Date(end).getTime()/1000); where.push(`"messageTimestamp" <= $${params.length}`); }
+
+  const baseSelect = `SELECT id, key, message, (key->>'remoteJid') AS "remoteJid", (key->>'fromMe')::boolean AS from_me, "messageType" AS type, status, to_timestamp("messageTimestamp") AT TIME ZONE 'UTC' AS when_utc FROM ${T_MESSAGE}`;
+  const whereSql = 'WHERE ' + where.join(' AND ');
+  const orderSql = 'ORDER BY "messageTimestamp" DESC';
+
+  try {
+    const total = (await pool.query(`SELECT COUNT(*)::int AS n FROM ${T_MESSAGE} ${whereSql}`, params)).rows[0].n;
+    const dataParams = params.concat([limit, page*limit]);
+    const sql = `${baseSelect} ${whereSql} ${orderSql} LIMIT $${params.length+1} OFFSET $${params.length+2}`;
+    debug('SQL messages:', sql, dataParams);
+    const { rows } = await pool.query(sql, dataParams);
+    const out = rows.map(r => ({
+      id: r.id,
+      jid: r.remoteJid,
+      when: new Date(r.when_utc).toISOString().replace('T',' ').slice(0,19),
+      direction: r.from_me ? 'out' : 'in',
+      type: r.type,
+      text: r.message?.conversation || r.message?.extendedTextMessage?.text || r.message?.imageMessage?.caption || r.message?.videoMessage?.caption || r.message?.documentMessage?.caption || r.message?.contactMessage?.displayName || '',
+      status: r.status || '',
+      media: extractMedia(r.message),
+    }));
+    info(`messages(instance=${instanceId}, jid=${remoteJid}) -> ${out.length}/${total} rows (page=${page}, limit=${limit}) in ${Date.now()-t0}ms`);
+    res.json({ total, rows: out });
+  } catch (e) {
+    error('messages ERROR:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/messages/:id', authMiddleware, async (req, res) => {
+  const id = req.params.id;
+  const t0 = Date.now();
+  try {
+    const sql = `SELECT id, key, message, "messageType", status, "messageTimestamp" FROM ${T_MESSAGE} WHERE id = $1`;
+    debug('SQL message by id:', sql, [id]);
+    const { rows } = await pool.query(sql, [id]);
+    if (!rows.length) { info(`message id=${id} not found (${Date.now()-t0}ms)`); return res.status(404).json({ error: 'not found' }); }
+    info(`message id=${id} ok (${Date.now()-t0}ms)`);
+    res.json(rows[0]);
+  } catch (e) {
+    error('message by id ERROR:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/messages.csv', authMiddleware, async (req, res) => {
+  req.query.limit = req.query.limit || '2000';
+  req.query.page = req.query.page || '0';
+  const params = new URLSearchParams(req.query);
+  const url = `http://127.0.0.1:${PORT}/api/messages?${params.toString()}`;
+  info('export CSV ->', url);
+  const r = await fetch(url);
+  const json = await r.json();
+  res.setHeader('Content-Type','text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition','attachment; filename="messages.csv"');
+  const header = 'id,when,direction,jid,type,text,status\n';
+  const body = json.rows.map(m => [m.id,m.when,m.direction,m.jid,m.type,(m.text||'').replaceAll('\n',' ').replaceAll('"','""'),m.status]
+      .map(v => '"'+(v??'')+'"').join(',')).join('\n');
+  res.send(header+body+'\n');
+});
+
+// ======= Error handler global =======
+app.use((err, req, res, next) => {
+  error('UNCAUGHT ERROR:', err?.stack || err?.message || String(err));
+  res.status(500).json({ error: 'Internal Server Error' });
+});
+process.on('unhandledRejection', (e) => error('unhandledRejection', e));
+process.on('uncaughtException', (e) => error('uncaughtException', e));
+
+// ======= Start =======
+(async () => {
+  info(`${APP} iniciando...`);
+  info('Config:', {
+    port: PORT,
+    pg: {
+      host: process.env.PGHOST || '(via DATABASE_URL)',
+      port: process.env.PGPORT || '(default 5432)',
+      db: process.env.PGDATABASE || '(via URL)',
+      ssl: process.env.PGSSL || 'disabled',
+      schema: PGSCHEMA,
+    }
+  });
+  try {
+    const r = await pool.query('SELECT current_database() as db');
+    info('DB conectado ->', r.rows?.[0]?.db);
+  } catch (e) {
+    warn('DB ainda não conectou:', e.message);
+  }
+  app.listen(PORT, () => info(`${APP} rodando em http://0.0.0.0:${PORT}`));
+})();
