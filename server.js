@@ -42,12 +42,14 @@ app.use(express.json({ limit: '2mb' }));
 
 // Saúde
 app.get('/health', async (req, res) => {
+  let db = false;
   try {
-    const r = await pool.query('SELECT 1');
-    res.json({ ok: true, db: r.rows[0]['?column?'] === 1 });
+    const r = await pool.query('SELECT 1 as n');
+    db = r.rows?.[0]?.n === 1;
   } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
+    db = false; // não derruba o health
   }
+  res.json({ ok: true, db });
 });
 
 // ======= API: Lista Instâncias =======
