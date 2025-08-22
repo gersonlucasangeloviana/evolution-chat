@@ -1,4 +1,3 @@
-\
 import express from 'express';
 import pkg from 'pg';
 import basicAuth from 'basic-auth';
@@ -270,7 +269,7 @@ function viewer(){
       const r = await fetch('/api/messages?'+p.toString());
       const json = await r.json();
       this.rows = json.rows;
-      this.meta = `Exibindo ${json.rows.length} de ${json.total} registros (página ${this.page+1}).`;
+      this.meta = 'Exibindo ' + json.rows.length + ' de ' + json.total + ' registros (página ' + (this.page+1) + ').';
     },
     next(){ this.page++; this.fetchMessages(); },
     prev(){ if(this.page>0){ this.page--; this.fetchMessages(); } },
